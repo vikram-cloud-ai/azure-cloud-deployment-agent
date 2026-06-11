@@ -224,7 +224,7 @@ def parse_user_input(state: DeploymentAgentState) -> DeploymentAgentState:
     return state
 
 
-async def generate_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
+async def generate_infra_code_mcp(state: DeploymentAgentState) -> DeploymentAgentState:
     """Generate Azure Bicep code using Azure CLI MCP tools and LLM."""
     print("Generating Azure Bicep code...")
     
@@ -246,7 +246,7 @@ async def generate_infra_code(state: DeploymentAgentState) -> DeploymentAgentSta
     llm_azcli = llm
     llm_azcli.bind_tools(filtered_tools)
     
-    system_msg = SystemMessage(
+    system_msg_mcp = SystemMessage(
         "You are an Azure Bicep architect generating production-ready infrastructure templates for ANY Azure service.\n\n"
         
         "CRITICAL WORKFLOW - ALWAYS USE TOOLS (NON-NEGOTIABLE):\n"
@@ -400,6 +400,140 @@ async def generate_infra_code(state: DeploymentAgentState) -> DeploymentAgentSta
         "- Start with parameters or resources, not explanatory text\n"
     )
     
+
+    system_msg = SystemMessage(
+          f"""
+    You are an Azure Bicep architect generating production-ready infrastructure templates for ANY Azure service.
+    Generate a syntactically correct Bicep template based on these requirements:
+    {json.dumps(state['input_parsed_json'], indent=2)}
+    
+    CRITICAL BICEP SYNTAX RULES:
+    1. Use ONLY single quotes (') for strings, NEVER double quotes (")
+    2. Do NOT use dollar signs ($) except in string interpolation: '${{variable}}'
+    3. Use camelCase for parameter and variable names
+    4. Resource syntax: resourceName 'Microsoft.Provider/type@YYYY-MM-DD' = {{}}
+    5. Parameter syntax: @description('...') param name type = defaultValue
+    6. Variable syntax: var name = value
+    7. Scope resources to resource group level only (no subscriptions or management groups)
+    8. ALWAYS use 'az.environment()' NOT 'environment()' - this is CRITICAL
+    9. For storage endpoints, use: az.environment().suffixes.storage
+    10. Do NOT set the 'tier' property on storage SKU - it is read-only
+    
+    API VERSION RULES:
+    - Use stable, well-tested API versions (avoid preview unless requested)
+    - Common valid versions (use latest available for each resource type):
+      * Storage Accounts: 2024-01-01
+      * Key Vaults: 2023-07-01
+      * Virtual Machines: 2024-03-01
+      * App Service Plans: 2023-01-01
+      * Function Apps (Web/sites): 2023-12-01
+      * AKS: 2024-02-01
+      * Cosmos DB: 2024-05-15
+      * Virtual Networks: 2024-01-01
+      * Application Insights: 2020-02-02
+    - For other resources, use the latest stable API version
+    
+    REQUIRED TEMPLATE STRUCTURE:
+    1. Parameters section:
+       - Add @description decorator for ALL parameters
+       - Use @secure() for sensitive values (passwords, keys, connection strings)
+       - Add validation: @minLength, @maxLength, @allowed, @minValue, @maxValue
+       - Provide sensible defaults
+    
+    2. Variables section (if needed):
+       - Extract complex expressions into variables
+       - Use for reusable values
+       - Descriptive camelCase naming
+    
+    3. Resources section:
+       - Use descriptive symbolic names (e.g., 'storageAccount', 'keyVault', 'virtualMachine')
+       - Include ALL properties from user request
+       - Apply security best practices by default
+    
+    4. Outputs section:
+       - Export resource ID (always)
+       - Export connection endpoints/URLs
+       - Export important properties (use listKeys() for keys)
+       - Add @description to all outputs
+    
+    AZURE WELL-ARCHITECTED FRAMEWORK (apply to ALL resources):
+    
+    Security:
+    - Enable system-assigned managed identity ONLY for compute/PaaS services that support it:
+      * App Services, Function Apps, Logic Apps, Container Apps
+      * Azure VMs, Virtual Machine Scale Sets
+      * Azure Kubernetes Service (AKS)
+      * API Management, Azure Spring Apps
+      * DO NOT enable for: Key Vault, Storage Accounts, Cosmos DB, or other infrastructure resources
+    - Use private endpoints for network isolation
+    - Enable encryption at rest and in transit
+    - Use latest TLS version (minimumTlsVersion: 'TLS1_2' or higher)
+    - Disable public network access by default
+    - Apply principle of least privilege
+    - NEVER hardcode secrets - use listKeys(), listSecrets(), or Key Vault references
+    
+    Reliability:
+    - Enable availability zones where applicable
+    - Use appropriate redundancy (LRS, ZRS, GRS for storage; geo-replication for databases)
+    - Configure diagnostic settings to Log Analytics workspace
+    - Enable backup and disaster recovery where applicable
+    
+    Performance:
+    - Select appropriate SKU/tier for the workload
+    - Enable caching mechanisms where available
+    - Configure auto-scaling where supported
+    
+    Cost Optimization:
+    - Right-size resources based on requirements
+    - Use consumption/serverless tiers when appropriate
+    - Apply comprehensive tagging for cost allocation
+    
+    Operational Excellence:
+    - Enable comprehensive logging to Log Analytics
+    - Configure monitoring and alerting
+    - Follow Azure naming conventions
+    - Add meaningful tags: Environment, Owner, CostCenter, Project
+    
+    CRITICAL RULES (known Azure limitations):
+    
+    1. Key Vault Purge Protection:
+       - NEVER set 'enablePurgeProtection: false' (causes deployment failure)
+       - Only include 'enablePurgeProtection: true' if explicitly requested
+       - If not requested, OMIT this property entirely (defaults to false)
+       - This is IRREVERSIBLE once enabled
+    
+    2. Secrets and Keys:
+       - NEVER use placeholder values like 'REPLACE_WITH_KEY'
+       - For storage keys: storageAccount.listKeys().keys[0].value
+       - For other secrets: use appropriate list* functions
+       - CRITICAL: Use 'az.environment()' NOT 'environment()' for endpoint suffixes
+       - Example for Function App storage connection string:
+         var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{storageAccount.listKeys().keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+       - For connection strings in outputs:
+         'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{listKeys(storageAccount.id, storageAccount.apiVersion).keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+    
+    3. Naming Constraints (follow Azure rules for each resource):
+       - Storage accounts: lowercase, 3-24 chars, alphanumeric only, globally unique
+       - Key Vaults: 3-24 chars, alphanumeric and hyphens, globally unique
+       - VMs: 1-64 chars for Windows, 1-15 chars for Linux
+       - Check Azure documentation for specific resource naming rules
+    
+    4. Common Best Practice Patterns:
+       - Storage: enableHttpsTrafficOnly: true, minimumTlsVersion: 'TLS1_2', allowBlobPublicAccess: false
+       - Key Vault: enableSoftDelete: true, softDeleteRetentionInDays: 90
+       - VMs: Use managed disks, enable boot diagnostics, configure backups
+       - Function Apps: Enable Application Insights, use consumption plan for cost savings
+       - Databases: Enable backups, configure firewall rules, use geo-redundancy for production
+    
+    OUTPUT REQUIREMENTS:
+    - Return ONLY valid Bicep code
+    - No markdown code blocks (no ```bicep)
+    - No explanatory text before or after the code
+    - Must be syntactically valid and deployable
+    - Apply best practices even if not explicitly requested
+    """
+    )
+
     human_msg = HumanMessage(
         f"Generate bicep schema for this deployment request: {state['input_parsed_json']}\n\n"
         "IMPORTANT: After using tools (bicepschema, get_bestpractices, documentation), "
@@ -463,6 +597,158 @@ async def generate_infra_code(state: DeploymentAgentState) -> DeploymentAgentSta
     return state
 
 
+async def generate_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
+    """Generate infrastructure code in Bicep for ANY Azure service using LLM."""
+    print("Generating Infrastructure Code...", state['input_parsed_json'])
+    
+    # Initialize refinement counter
+    state['refinement_attempts'] = 0
+    
+    infra_prompt = f"""
+    You are an Azure Bicep architect generating production-ready infrastructure templates for ANY Azure service.
+    Generate a syntactically correct Bicep template based on these requirements:
+    {json.dumps(state['input_parsed_json'], indent=2)}
+    
+    CRITICAL BICEP SYNTAX RULES:
+    1. Use ONLY single quotes (') for strings, NEVER double quotes (")
+    2. Do NOT use dollar signs ($) except in string interpolation: '${{variable}}'
+    3. Use camelCase for parameter and variable names
+    4. Resource syntax: resourceName 'Microsoft.Provider/type@YYYY-MM-DD' = {{}}
+    5. Parameter syntax: @description('...') param name type = defaultValue
+    6. Variable syntax: var name = value
+    7. Scope resources to resource group level only (no subscriptions or management groups)
+    8. ALWAYS use 'az.environment()' NOT 'environment()' - this is CRITICAL
+    9. For storage endpoints, use: az.environment().suffixes.storage
+    10. Do NOT set the 'tier' property on storage SKU - it is read-only
+    
+    API VERSION RULES:
+    - Use stable, well-tested API versions (avoid preview unless requested)
+    - Common valid versions (use latest available for each resource type):
+      * Storage Accounts: 2024-01-01
+      * Key Vaults: 2023-07-01
+      * Virtual Machines: 2024-03-01
+      * App Service Plans: 2023-01-01
+      * Function Apps (Web/sites): 2023-12-01
+      * AKS: 2024-02-01
+      * Cosmos DB: 2024-05-15
+      * Virtual Networks: 2024-01-01
+      * Application Insights: 2020-02-02
+    - For other resources, use the latest stable API version
+    
+    REQUIRED TEMPLATE STRUCTURE:
+    1. Parameters section:
+       - Add @description decorator for ALL parameters
+       - Use @secure() for sensitive values (passwords, keys, connection strings)
+       - Add validation: @minLength, @maxLength, @allowed, @minValue, @maxValue
+       - Provide sensible defaults
+    
+    2. Variables section (if needed):
+       - Extract complex expressions into variables
+       - Use for reusable values
+       - Descriptive camelCase naming
+    
+    3. Resources section:
+       - Use descriptive symbolic names (e.g., 'storageAccount', 'keyVault', 'virtualMachine')
+       - Include ALL properties from user request
+       - Apply security best practices by default
+    
+    4. Outputs section:
+       - Export resource ID (always)
+       - Export connection endpoints/URLs
+       - Export important properties (use listKeys() for keys)
+       - Add @description to all outputs
+    
+    AZURE WELL-ARCHITECTED FRAMEWORK (apply to ALL resources):
+    
+    Security:
+    - Enable system-assigned managed identity ONLY for compute/PaaS services that support it:
+      * App Services, Function Apps, Logic Apps, Container Apps
+      * Azure VMs, Virtual Machine Scale Sets
+      * Azure Kubernetes Service (AKS)
+      * API Management, Azure Spring Apps
+      * DO NOT enable for: Key Vault, Storage Accounts, Cosmos DB, or other infrastructure resources
+    - Use private endpoints for network isolation
+    - Enable encryption at rest and in transit
+    - Use latest TLS version (minimumTlsVersion: 'TLS1_2' or higher)
+    - Disable public network access by default
+    - Apply principle of least privilege
+    - NEVER hardcode secrets - use listKeys(), listSecrets(), or Key Vault references
+    
+    Reliability:
+    - Enable availability zones where applicable
+    - Use appropriate redundancy (LRS, ZRS, GRS for storage; geo-replication for databases)
+    - Configure diagnostic settings to Log Analytics workspace
+    - Enable backup and disaster recovery where applicable
+    
+    Performance:
+    - Select appropriate SKU/tier for the workload
+    - Enable caching mechanisms where available
+    - Configure auto-scaling where supported
+    
+    Cost Optimization:
+    - Right-size resources based on requirements
+    - Use consumption/serverless tiers when appropriate
+    - Apply comprehensive tagging for cost allocation
+    
+    Operational Excellence:
+    - Enable comprehensive logging to Log Analytics
+    - Configure monitoring and alerting
+    - Follow Azure naming conventions
+    - Add meaningful tags: Environment, Owner, CostCenter, Project
+    
+    CRITICAL RULES (known Azure limitations):
+    
+    1. Key Vault Purge Protection:
+       - NEVER set 'enablePurgeProtection: false' (causes deployment failure)
+       - Only include 'enablePurgeProtection: true' if explicitly requested
+       - If not requested, OMIT this property entirely (defaults to false)
+       - This is IRREVERSIBLE once enabled
+    
+    2. Secrets and Keys:
+       - NEVER use placeholder values like 'REPLACE_WITH_KEY'
+       - For storage keys: storageAccount.listKeys().keys[0].value
+       - For other secrets: use appropriate list* functions
+       - CRITICAL: Use 'az.environment()' NOT 'environment()' for endpoint suffixes
+       - Example for Function App storage connection string:
+         var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{storageAccount.listKeys().keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+       - For connection strings in outputs:
+         'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{listKeys(storageAccount.id, storageAccount.apiVersion).keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+    
+    3. Naming Constraints (follow Azure rules for each resource):
+       - Always follow the Azure naming rules for the specific resource type being deployed
+       - Storage accounts: lowercase, 3-24 chars, alphanumeric only, globally unique
+       - Key Vaults: 3-24 chars, alphanumeric and hyphens, globally unique
+       - VMs: 1-64 chars for Windows, 1-15 chars for Linux
+       - App Service / Function App: 2-60 chars, alphanumeric and hyphens
+       - For any other resource type, apply its documented Azure naming constraints
+    
+    4. Common Best Practice Patterns (apply relevant ones for the resource being deployed):
+       - Storage: enableHttpsTrafficOnly: true, minimumTlsVersion: 'TLS1_2', allowBlobPublicAccess: false
+       - Key Vault: enableSoftDelete: true, softDeleteRetentionInDays: 90
+       - VMs: Use managed disks, enable boot diagnostics, configure backups
+       - Function Apps: Enable Application Insights, use consumption plan for cost savings
+       - Databases: Enable backups, configure firewall rules, use geo-redundancy for production
+       - Networking: Apply NSG rules, enable DDoS protection where appropriate
+       - Containers/AKS: Enable RBAC, use managed identity, configure network policy
+       - For ANY other Azure service: enable encryption at rest and in transit, configure
+         diagnostic settings to Log Analytics, disable public network access by default,
+         apply minimum TLS where applicable, and follow the resource-specific WAF guidance
+    
+    OUTPUT REQUIREMENTS:
+    - Return ONLY valid Bicep code
+    - No markdown code blocks (no ```bicep)
+    - No explanatory text before or after the code
+    - Must be syntactically valid and deployable
+    - Apply best practices even if not explicitly requested
+    """
+
+    response = llm.invoke(infra_prompt)
+    state['infra_code'] = response.content
+    print("Generated Infrastructure Code:\n", response.content)
+    return state
+
+
+
 def build_bicep(state: DeploymentAgentState) -> DeploymentAgentState:
     """Build Bicep file before deployment."""
     print("Building Bicep file...")
@@ -496,7 +782,7 @@ def build_bicep(state: DeploymentAgentState) -> DeploymentAgentState:
     return state
 
 
-def refine_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
+def refine_infra_code_mcp(state: DeploymentAgentState) -> DeploymentAgentState:
     """Refine infrastructure code based on validation results using LLM."""
     print("Refining Infrastructure Code based on validation results...")
     
@@ -629,70 +915,203 @@ def refine_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
     return state
 
 
-# def prevalidate_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
-#     """
-#     Pre-validate Bicep template using Azure CLI before deployment.
+def refine_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
+    """Refine infrastructure code based on validation results using LLM."""
+    print("Refining Infrastructure Code based on validation results...")
+
+    # Increment refinement counter
+    current_attempts = state.get('refinement_attempts', 0)
+    state['refinement_attempts'] = current_attempts + 1
+    print(f"Refinement attempt {state['refinement_attempts']} of 5")
     
-#     NOTE: This validation can be slow (30-90 seconds) and is optional.
-#     The actual deployment will also validate the template.
-#     Consider skipping this step if it's taking too long.
-#     """
-#     print("\n🔍 Pre-validating Bicep template...")
-#     print("⏳ This may take 30-60 seconds...")
+    # Get the build error if available
+    build_error = state.get('build_error', '')
     
-#     # Option to skip validation for faster workflow
-#     skip_validation = True  # Set to True to skip this step
+    refine_prompt = f"""
+    You are an Azure Bicep architect. The following Bicep code has errors and must be fixed.
+    This function handles ANY Azure service - apply the relevant guidance for the resource type present.
     
-#     if skip_validation:
-#         print("⚠️  Validation skipped (skip_validation=True)")
-#         state['deploy_infra_validate_status'] = "Skipped"
-#         return state
+    Current Bicep Code:
+    {state['infra_code']}
     
-#     try:
-#         with tempfile.NamedTemporaryFile(mode='w', suffix='.bicep', delete=False) as f:
-#             f.write(state['infra_code'])
-#             bicep_file = f.name
+    Build Error (if any):
+    {build_error}
     
-#         # Validate the deployment using az deployment group validate
-#         resource_group = state['input_parsed_json'].get('parameters', {}).get('resource_group', 'rg-aidemo')
-#         print(f"📦 Resource Group: {resource_group}")
-        
-#         result = run_az_command([
-#             "deployment", "group", "validate",
-#             "--resource-group", resource_group, 
-#             "--template-file", bicep_file,
-#             "--no-prompt"  # Don't prompt for parameter values
-#         ], timeout=60)  # Reduced to 60 seconds timeout
-        
-#         os.unlink(bicep_file)
-        
-#         if result.returncode == 0:
-#             print("✅ Pre-validation succeeded")
-#             state['deploy_infra_validate_status'] = "Pass"
-#         else:
-#             print("❌ Pre-validation failed:")
-#             if result.stderr:
-#                 # Print first 500 chars of error
-#                 error_msg = result.stderr[:500] + "..." if len(result.stderr) > 500 else result.stderr
-#                 print(error_msg)
-#             state['deploy_infra_validate_status'] = "Fail"
-            
-#     except subprocess.TimeoutExpired:
-#         print("⚠️  Validation timed out after 60 seconds.")
-#         print("💡 Skipping validation and proceeding to deployment.")
-#         print("   The deployment step will validate the template anyway.")
-#         state['deploy_infra_validate_status'] = "Timeout"
-#         # Don't fail - let deployment proceed
-#     except FileNotFoundError:
-#         print("❌ Resource group not found. It will be created during deployment.")
-#         state['deploy_infra_validate_status'] = "Skipped"
-#     except Exception as e:
-#         print(f"⚠️  Validation error: {e}")
-#         print("💡 Proceeding to deployment anyway.")
-#         state['deploy_infra_validate_status'] = "Error"
-#         # Don't fail - let deployment proceed
+    CRITICAL: ANALYZE THE ERROR MESSAGE FIRST
+    - If error mentions "property ... is not allowed", REMOVE that property completely
+    - If error is BCP037 (property not allowed), the property is invalid for this resource type - remove it
+    - Common errors: using 'scope', 'apiVersion', 'type' as resource properties (INVALID)
+    - Only use properties that are valid for the specific Azure resource type in the schema
     
-#     return state
+    REFINING APPROACH:
+    1. READ the error message carefully and understand what's wrong
+    2. Fix the specific syntax errors mentioned in the error
+    3. Remove any invalid properties (scope, apiVersion, type used as properties)
+    4. Verify API versions are in correct format (YYYY-MM-DD or YYYY-MM-DD-preview)
+    5. Ensure all properties are valid for the resource type
+    6. Apply security best practices
+    7. Follow Bicep coding standards
+    
+    BICEP SYNTAX REQUIREMENTS:
+    - Use ONLY single quotes (') for strings, NEVER double quotes (")
+    - No dollar signs ($) except in string interpolation: '${{variable}}'
+    - camelCase for parameters, variables, and resource symbolic names
+    - Resource syntax: resourceName 'Microsoft.Provider/type@YYYY-MM-DD' = {{}}
+    - Parameter syntax: @description('...') param name type = defaultValue
+    - Variable syntax: var name = value
+    - Scope resources to resource group level only (no subscriptions or management groups)
+    - ALWAYS use 'az.environment()' NOT 'environment()' - this is CRITICAL
+    - For storage endpoints, use: az.environment().suffixes.storage
+    - Do NOT set the 'tier' property on storage SKU - it is read-only
+    
+    API VERSION RULES:
+    - Use stable, well-tested API versions (avoid preview unless the existing code already uses preview)
+    - Common valid versions (reference only - verify for the specific resource type):
+      * Storage Accounts: 2024-01-01
+      * Key Vaults: 2023-07-01
+      * Virtual Machines: 2024-03-01
+      * App Service Plans: 2023-01-01
+      * Function Apps (Web/sites): 2023-12-01
+      * AKS: 2024-02-01
+      * Cosmos DB: 2024-05-15
+      * Virtual Networks: 2024-01-01
+      * Application Insights: 2020-02-02
+    - For any other resource type, use the latest known stable API version
+    
+    CRITICAL BICEP SYNTAX ERRORS TO FIX:
+    
+    1. REMOVE invalid properties (MOST COMMON ERROR):
+       - NEVER use 'scope' as a resource property - it's NOT ALLOWED on regular resources
+       - 'scope' is only for module/extension resources, NOT for regular Azure resources
+       - If you see "scope: resourceGroup()" or "scope: subscription()" INSIDE a resource block, DELETE IT
+       - Also remove if present as a property: apiVersion, type, resourceType
+       - Example: If error says "property 'scope' is not allowed", REMOVE the entire "scope: ..." line
+    
+    2. Resource structure (CORRECT FORMAT):
+       - Declaration: resource <name> '<type>@<version>' = {{ name: '...', location: '...', ... }}
+       - Properties go INSIDE the {{ }} block
+       - Valid top-level resource properties: name, location, tags, sku, kind, properties, identity, dependsOn
+       - INVALID as properties (these are part of the declaration, not the body): scope, type, apiVersion
+    
+    3. Property validation:
+       - Only use properties that are documented for that specific Azure resource type
+       - If error says "property X is not allowed on objects of type Y", DELETE property X
+       - If unsure whether a property is valid for the resource type, omit it
+    
+    AZURE WELL-ARCHITECTED FRAMEWORK (apply to ALL resources):
+    
+    Security:
+    - Enable system-assigned managed identity ONLY for compute/PaaS services that support it:
+      * App Services, Function Apps, Logic Apps, Container Apps
+      * Azure VMs, Virtual Machine Scale Sets
+      * Azure Kubernetes Service (AKS)
+      * API Management, Azure Spring Apps
+      * DO NOT enable for: Key Vault, Storage Accounts, Cosmos DB, or other infrastructure resources
+    - Use private endpoints for network isolation
+    - Enable encryption at rest and in transit
+    - Set latest TLS version (minimumTlsVersion: 'TLS1_2' or higher) where applicable
+    - Disable public network access unless explicitly required
+    - Never use placeholder secrets - use listKeys(), listSecrets(), or Key Vault references
+    - Apply principle of least privilege for access policies
+    
+    Reliability:
+    - Enable diagnostic settings pointing to Log Analytics workspace
+    - Use appropriate redundancy options (zone redundancy, geo-redundancy) for the resource type
+    - Configure backup where applicable
+    - Enable monitoring and alerting capabilities
+    
+    Template Quality:
+    - Add @description decorator to ALL parameters and outputs
+    - Use @secure() for sensitive parameters (passwords, connection strings, keys)
+    - Add parameter validation (@minLength, @maxLength, @allowed, @minValue, @maxValue)
+    - Extract complex expressions into variables for readability
+    - Add meaningful tags (Environment, Owner, CostCenter, Project)
+    - Include comprehensive outputs (resource ID, endpoints, important properties)
+    
+    Performance & Cost:
+    - Use appropriate SKU/tier for the workload
+    - Enable auto-scaling where supported
+    - Consider consumption-based pricing tiers
+    
+    CRITICAL RULES (known Azure limitations):
+    
+    1. Key Vault Purge Protection:
+       - NEVER set 'enablePurgeProtection: false' (causes deployment failure)
+       - Only include 'enablePurgeProtection: true' if explicitly present in the original code
+       - If not present, OMIT this property entirely (defaults to false)
+       - This is IRREVERSIBLE once enabled
+    
+    2. Secrets and Keys:
+       - NEVER use placeholder values like 'REPLACE_WITH_KEY'
+       - For storage keys: storageAccount.listKeys().keys[0].value
+       - For other secrets: use appropriate list* functions
+       - CRITICAL: Use 'az.environment()' NOT 'environment()' for endpoint suffixes
+       - Example for Function App storage connection string:
+         var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{storageAccount.listKeys().keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+       - For connection strings in outputs:
+         'DefaultEndpointsProtocol=https;AccountName=${{storageAccount.name}};AccountKey=${{listKeys(storageAccount.id, storageAccount.apiVersion).keys[0].value}};EndpointSuffix=${{az.environment().suffixes.storage}}'
+    
+    3. Naming Constraints (apply the relevant rules for the resource type being fixed):
+       - Always follow the Azure naming rules for the specific resource type
+       - Storage accounts: lowercase, 3-24 chars, alphanumeric only, globally unique
+       - Key Vaults: 3-24 chars, alphanumeric and hyphens, globally unique
+       - VMs: 1-64 chars for Windows, 1-15 chars for Linux
+       - App Service / Function App: 2-60 chars, alphanumeric and hyphens
+       - For any other resource type, apply its documented Azure naming constraints
+    
+    4. Common Best Practice Patterns (apply relevant ones for the resource being fixed):
+       - Storage: enableHttpsTrafficOnly: true, minimumTlsVersion: 'TLS1_2', allowBlobPublicAccess: false
+       - Key Vault: enableSoftDelete: true, softDeleteRetentionInDays: 90
+       - VMs: Use managed disks, enable boot diagnostics, configure backups
+       - Function Apps: Enable Application Insights, use consumption plan for cost savings
+       - Databases: Enable backups, configure firewall rules, use geo-redundancy for production
+       - Networking: Apply NSG rules, enable DDoS protection where appropriate
+       - Containers/AKS: Enable RBAC, use managed identity, configure network policy
+       - For ANY other Azure service: enable encryption, configure diagnostic settings,
+         disable public network access by default, apply minimum TLS where applicable
+    
+    OUTPUT REQUIREMENTS:
+    - Return ONLY the corrected, production-ready Bicep code
+    - No markdown code blocks or formatting (no ```bicep```)
+    - No explanatory text before or after the code
+    - Must be syntactically valid and deployable
+    """
+    response = llm.invoke(refine_prompt)
+    
+    # Extract text content robustly - handle different response formats
+    text_content = None
+    
+    if hasattr(response, 'content_blocks') and response.content_blocks:
+        # Get text blocks
+        text_blocks = [block.get('text', '') for block in response.content_blocks if block.get('type') == 'text']
+        if text_blocks:
+            # Take the longest text block (likely the Bicep code)
+            text_content = max(text_blocks, key=len)
+    
+    # Fallback to .content attribute
+    if not text_content and hasattr(response, 'content'):
+        text_content = response.content if isinstance(response.content, str) else str(response.content)
+    
+    # Validate we got something
+    if not text_content or len(text_content.strip()) < 50:
+        print("❌ ERROR: Failed to extract refined Bicep code from LLM response")
+        # Keep the old code if refinement fails
+        return state
+    
+    # Clean up the content - remove markdown code blocks if present
+    text_content = text_content.strip()
+    if text_content.startswith('```'):
+        lines = text_content.split('\n')
+        if lines[0].startswith('```'):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == '```':
+            lines = lines[:-1]
+        text_content = '\n'.join(lines).strip()
+    
+    state['infra_code'] = text_content
+    print("Refined Infrastructure Code:\n", text_content[:200] + "..." if text_content else "No content")
+    return state
+
 
 
 def human_review(state: DeploymentAgentState) -> Command[Literal["deploy_infra_with_cli", "__end__"]]:

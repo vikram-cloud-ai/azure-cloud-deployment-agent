@@ -71,4 +71,5 @@ class DeploymentAgentState(TypedDict):
     deployment_status: Literal["Success", "Failure"]
     infra_build_status: Literal["Pass", "Fail"]
     deploy_infra_validate_status: Literal["Pass", "Fail"]
+    refinement_attempts: NotRequired[int]  # Track number of refinement attempts to prevent infinite loops
     build_error: NotRequired[str]  # Stores Bicep build errors for refinement
