@@ -1183,7 +1183,13 @@ def _poll_slack_thread(token: str, channel: str, ts: str, timeout_minutes: int =
             )
             data = resp.json()
             if data.get("ok"):
-                for msg in data.get("messages", [])[1:]:  # skip the original post
+
+                allowed_approvers = set(filter(None, os.getenv("SLACK_APPROVER_IDS", "").split(",")))
+
+                for msg in data.get("messages", [])[1:]:
+                    sender = msg.get("user", "")
+                    if allowed_approvers and sender not in allowed_approvers:
+                        continue  # ignore replies from unauthorized users
                     reply = msg.get("text", "").lower().strip()
                     if any(w in reply for w in ("approve", "yes", ":white_check_mark:")):
                         print(f"✅ Approved via Slack (user: {msg.get('user', 'unknown')})")
@@ -1584,6 +1590,12 @@ def deploy_infra_with_cli(state: DeploymentAgentState) -> DeploymentAgentState:
     
     return state
 
+ALLOWED_SLACK_HOST = "hooks.slack.com"
+import urllib.parse
+
+def _validate_slack_webhook_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.netloc == ALLOWED_SLACK_HOST
 
 def verify_deployment(state: DeploymentAgentState) -> DeploymentAgentState:
     """Verify the deployment status using Azure CLI."""
@@ -1640,9 +1652,10 @@ def send_approval_to_slackchannel(state: DeploymentAgentState) -> DeploymentAgen
     print("Sending deployment approval request to Slack channel...")
     
     try:
+
         slack_webhook_url = state.get('slack_webhook_url')
-        if not slack_webhook_url:
-            print("❌ Slack webhook URL not configured in state. Skipping Slack notification.")
+        if not slack_webhook_url or not _validate_slack_webhook_url(slack_webhook_url):
+            print("❌ Invalid or missing Slack webhook URL.")
             return state
         
         resource_name = state['input_parsed_json']['parameters'].get('name', 'Unknown')
