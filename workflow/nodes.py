@@ -1191,10 +1191,13 @@ def _poll_slack_thread(token: str, channel: str, ts: str, timeout_minutes: int =
                     if allowed_approvers and sender not in allowed_approvers:
                         continue  # ignore replies from unauthorized users
                     reply = msg.get("text", "").lower().strip()
-                    if any(w in reply for w in ("approve", "yes", ":white_check_mark:")):
+
+                    APPROVE_KEYWORDS = ("approved", "approve deployment", ":white_check_mark:")
+                    REJECT_KEYWORDS  = ("rejected", "reject deployment", "deny deployment", ":x:")
+                    if any(w in reply for w in APPROVE_KEYWORDS ):
                         print(f"✅ Approved via Slack (user: {msg.get('user', 'unknown')})")
                         return True
-                    if any(w in reply for w in ("reject", "no", "deny", ":x:")):
+                    if any(w in reply for w in REJECT_KEYWORDS ):
                         print(f"❌ Rejected via Slack (user: {msg.get('user', 'unknown')})")
                         return False
         except Exception as e:
@@ -1666,7 +1669,7 @@ def send_approval_to_slackchannel(state: DeploymentAgentState) -> DeploymentAgen
             "text": f"Deployment Approval Request:\nResource Type: {resource_type}\nResource Name: {resource_name}\nResource Group: {resource_group}\nPlease review and approve the deployment."
         }
         
-        response = requests.post(slack_webhook_url, json=message_payload)
+        response = requests.post(slack_webhook_url, json=message_payload, timeout=10)
         
         if response.status_code == 200:
             print("✅ Deployment approval request sent to Slack successfully.")
