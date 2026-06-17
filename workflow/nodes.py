@@ -6,7 +6,8 @@ import tempfile
 import subprocess
 import time
 import platform
-from typing import Literal
+import requests
+from typing import Literal, Optional
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.messages import HumanMessage, SystemMessage
@@ -1114,47 +1115,164 @@ def refine_infra_code(state: DeploymentAgentState) -> DeploymentAgentState:
 
 
 
+def _get_slack_config() -> tuple[Optional[str], dict]:
+    """Return ('bot', config), ('webhook', config), or (None, {}) based on env vars."""
+    bot_token = os.getenv("SLACK_BOT_TOKEN")
+    channel = os.getenv("SLACK_CHANNEL_ID")
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+
+    if bot_token and channel:
+        return "bot", {"token": bot_token, "channel": channel}
+    elif webhook_url:
+        return "webhook", {"url": webhook_url}
+    return None, {}
+
+
+def _build_slack_approval_text(state: DeploymentAgentState) -> str:
+    """Build the Slack message text for a deployment approval request."""
+    params = state['input_parsed_json'].get('parameters', {})
+    code_preview = state['infra_code'][:1200]
+    truncated = "..." if len(state['infra_code']) > 1200 else ""
+    return (
+        f"*:rocket: Azure Deployment Approval Required*\n\n"
+        f"*Resource Type:* {state['input_parsed_json'].get('resource_type', 'Unknown')}\n"
+        f"*Name:* {params.get('name', 'Unknown')}\n"
+        f"*Location:* {params.get('location', 'Unknown')}\n"
+        f"*Resource Group:* {params.get('resource_group', 'Unknown')}\n"
+        f"*Build Status:* {state.get('infra_build_status', 'N/A')}\n"
+        f"*Validation Status:* {state.get('deploy_infra_validate_status', 'N/A')}\n\n"
+        f"*Bicep Code Preview:*\n```{code_preview}{truncated}```\n\n"
+        f"Reply `approve` or `reject` in this thread to proceed."
+    )
+
+
+def _post_slack_bot_message(token: str, channel: str, text: str) -> Optional[str]:
+    """Post a message via Slack Bot API. Returns the message timestamp (ts) on success."""
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"channel": channel, "text": text},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            return data["ts"]
+        print(f"⚠️ Slack API error: {data.get('error')}")
+    except Exception as e:
+        print(f"⚠️ Slack bot message error: {e}")
+    return None
+
+
+def _poll_slack_thread(token: str, channel: str, ts: str, timeout_minutes: int = 60) -> Optional[bool]:
+    """Poll a Slack thread for an approve/reject reply.
+
+    Returns True (approved), False (rejected), or None (timeout).
+    Checks every 15 seconds; keywords: approve/yes or reject/no/deny.
+    """
+    deadline = time.time() + timeout_minutes * 60
+    print(f"⏳ Polling Slack thread for approval (timeout: {timeout_minutes} min)...")
+
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                "https://slack.com/api/conversations.replies",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"channel": channel, "ts": ts},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                for msg in data.get("messages", [])[1:]:  # skip the original post
+                    reply = msg.get("text", "").lower().strip()
+                    if any(w in reply for w in ("approve", "yes", ":white_check_mark:")):
+                        print(f"✅ Approved via Slack (user: {msg.get('user', 'unknown')})")
+                        return True
+                    if any(w in reply for w in ("reject", "no", "deny", ":x:")):
+                        print(f"❌ Rejected via Slack (user: {msg.get('user', 'unknown')})")
+                        return False
+        except Exception as e:
+            print(f"⚠️ Slack poll error: {e}")
+
+        time.sleep(15)
+
+    print("⚠️ Slack approval timed out")
+    return None
+
+
+def _send_slack_webhook(url: str, text: str) -> bool:
+    """Send a one-way notification via Slack Incoming Webhook."""
+    try:
+        resp = requests.post(url, json={"text": text}, timeout=10)
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"⚠️ Slack webhook error: {e}")
+        return False
+
+
 def human_review(state: DeploymentAgentState) -> Command[Literal["deploy_infra_with_cli", "__end__"]]:
-    """Pause for human review using interrupt and route based on decision."""
+    """Pause for human review. Uses Slack Bot if configured, Webhook notification if only
+    a webhook is configured, or falls back to LangGraph interrupt for manual approval."""
     
-    # Print deployment summary
+    params = state['input_parsed_json'].get('parameters', {})
     print("\n" + "="*80)
     print("DEPLOYMENT SUMMARY")
     print("="*80)
     print(f"Resource Type: {state['input_parsed_json'].get('resource_type', 'Unknown')}")
-    print(f"Resource Name: {state['input_parsed_json'].get('parameters', {}).get('name', 'Unknown')}")
-    print(f"Location: {state['input_parsed_json'].get('parameters', {}).get('location', 'Unknown')}")
-    print(f"Resource Group: {state['input_parsed_json'].get('parameters', {}).get('resource_group', 'Unknown')}")
+    print(f"Resource Name: {params.get('name', 'Unknown')}")
+    print(f"Location: {params.get('location', 'Unknown')}")
+    print(f"Resource Group: {params.get('resource_group', 'Unknown')}")
     print(f"Build Status: {state.get('infra_build_status', 'N/A')}")
     print(f"Validation Status: {state.get('deploy_infra_validate_status', 'N/A')}")
     print("="*80)
-    
-    # Print the generated Bicep code to console for review
     print("\nGENERATED BICEP CODE FOR REVIEW:")
     print("-"*80)
     print(state['infra_code'])
     print("-"*80)
-    print("\n⏸️  Waiting for human approval...\n")
-    
-    # Interrupt() must come first (after prints) - any code before it will re-run on resume
+
+    slack_mode, slack_config = _get_slack_config()
+    message_text = _build_slack_approval_text(state)
+
+    if slack_mode == "bot":
+        # Full Slack approval: post message and poll thread for reply
+        ts = _post_slack_bot_message(slack_config["token"], slack_config["channel"], message_text)
+        if ts:
+            print(f"📨 Approval request posted to Slack channel '{slack_config['channel']}'")
+            print("⏸️  Waiting for Slack reply ('approve' or 'reject' in thread)...\n")
+            decision = _poll_slack_thread(slack_config["token"], slack_config["channel"], ts)
+            if decision is True:
+                return Command(update=None, goto="deploy_infra_with_cli")
+            elif decision is False:
+                return Command(update=None, goto=END)
+            else:
+                print("⚠️ Slack approval timed out — falling back to manual approval")
+        else:
+            print("⚠️ Could not post to Slack — falling back to manual approval")
+
+    elif slack_mode == "webhook":
+        # One-way Slack notification; still require manual approval via interrupt
+        if _send_slack_webhook(slack_config["url"], message_text):
+            print("📨 Deployment details sent to Slack via webhook")
+        else:
+            print("⚠️ Slack webhook notification failed")
+        print("\n⏸️  Waiting for manual approval (check Slack for deployment details)...\n")
+
+    else:
+        print("\n⏸️  Waiting for human approval...\n")
+
+    # Fallback / webhook mode: use LangGraph interrupt for manual approval
+    # interrupt() suspends the graph; caller resumes it by passing {"approved": true/false}
     human_decision = interrupt({
         "generated_infra_code": state['infra_code'],
         "action": "Please review and approve/edit this response"
     })
 
-    # Now process the human's decision
     if human_decision.get("approved"):
         print("✅ Deployment approved by user")
-        return Command(
-            update=None,
-            goto="deploy_infra_with_cli"
-        )
+        return Command(update=None, goto="deploy_infra_with_cli")
     else:
         print("❌ Deployment rejected by user. Ending process.")
-        return Command(
-            update=None,
-            goto=END
-        )
+        return Command(update=None, goto=END)
 
 
 def deploy_infra_with_cli(state: DeploymentAgentState) -> DeploymentAgentState:
@@ -1516,3 +1634,33 @@ def verify_deployment(state: DeploymentAgentState) -> DeploymentAgentState:
         print(f"Error during deployment verification: {e}")
     
     return {}
+
+def send_approval_to_slackchannel(state: DeploymentAgentState) -> DeploymentAgentState:
+    """Send deployment approval request to Slack channel."""
+    print("Sending deployment approval request to Slack channel...")
+    
+    try:
+        slack_webhook_url = state.get('slack_webhook_url')
+        if not slack_webhook_url:
+            print("❌ Slack webhook URL not configured in state. Skipping Slack notification.")
+            return state
+        
+        resource_name = state['input_parsed_json']['parameters'].get('name', 'Unknown')
+        resource_type = state['input_parsed_json'].get('resource_type', 'Unknown')
+        resource_group = state['input_parsed_json']['parameters'].get('resource_group', 'Unknown')
+        
+        message_payload = {
+            "text": f"Deployment Approval Request:\nResource Type: {resource_type}\nResource Name: {resource_name}\nResource Group: {resource_group}\nPlease review and approve the deployment."
+        }
+        
+        response = requests.post(slack_webhook_url, json=message_payload)
+        
+        if response.status_code == 200:
+            print("✅ Deployment approval request sent to Slack successfully.")
+        else:
+            print(f"❌ Failed to send Slack notification. Status Code: {response.status_code}, Response: {response.text}")
+    
+    except Exception as e:
+        print(f"Error sending approval to Slack channel: {e}")
+    
+    return state
